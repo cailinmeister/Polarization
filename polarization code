@@ -1,0 +1,251 @@
+#This is the code for the simulations run for the article "Scientific Polarization", by Cailin O'Connor and James Weatherall,
+# and for parts of the book _The Misinformation Age_, by the same authors.  Code written by Weatherall, 2017-18.  Last updates 15 April 2018.
+
+n=32
+addprocs(n-length(procs())) #Starts new workers so that a total of n are running
+
+@everywhere using Distributions #For random number generation and result analysis
+
+@everywhere type Player #Define a type that will represent each node in the network of agents
+  belief #Player attribute recording current belief that arm B is preferable to arm A; Float64 in interval [0,1].
+  result #Player attribute recording most recent result (if arm B drawn); integer <= binom_n
+  friends #Player attribute recording neighbors (reflexively); vector of indices of players vector
+  goodfriends #Player attribute recording which neighbors' beliefs were such that they performed the informative action (arm B)
+end
+
+@everywhere type Game #Define a type that will characterize the game parameters and network configuration
+  binom_n #the number n of samples taken each round; an integer
+  epsilon #the number P_B - .5, i.e., the bias of the better arm; Float64 in the interval [0,.5]
+  multiplier #the multiplier m appearing in the formulae for P_f(E)
+  players #A vector of agents, i.e., a vector of type players
+  func #A string that records which updating function for P_f(E) is being used: may be antiUpdate, noAntiUpdate, exponential, logistic, etc.
+end
+
+@everywhere Game() = Game(0,0,0,[],"default") #Define the default constructor for a game
+
+@everywhere function Update(game,player) #A function that updates player's beliefs in light of their neighbors' most recent results
+  for i in player.goodfriends #For each of player's neighbors who performed the informative action, proceed to update beliefs
+    if game.binom_n < 66 #Here we have a workaround for the fact that the built-in n choose k function does not work for large n
+      K=binomial(game.binom_n,game.players[i].result)
+    else
+      K=floor(1 / ((game.binom_n+1) * beta(game.players[i].result+1, game.binom_n-game.players[i].result+1)))
+    end
+    PIEH = K*((.5+game.epsilon)^game.players[i].result)*(.5-game.epsilon)^(game.binom_n-game.players[i].result) #Calculate prior P_i(E|H)
+    PIEnotH = K*((.5-game.epsilon)^game.players[i].result)*(.5+game.epsilon)^(game.binom_n-game.players[i].result) #Calculate prior P_i(E|-H)
+    PIE = PIEH*player.belief + PIEnotH*(1-player.belief) #Law of total probability yields P_i(E)
+    d = abs(player.belief - game.players[i].belief) #calculate distance in belief between player and neighbor, i
+
+    if game.func == "noAntiUpdate" #Calculate P_f(E) with linear function, no anti-updating
+      PFE = 1 - min(game.multiplier*d,1)*(1-PIE)
+    elseif game.func == "antiUpdate" #Calculate P_f(E) with linear function, with anti-updating
+      PFE = max(1 - game.multiplier*d*(1-PIE),0)
+    elseif game.func == "logistic" #Calculate P_f(E) with logistic function, with anti-updating
+      PFE = 1/(1+exp(game.multiplier*(d-1/2)))
+    elseif game.func == "logisticNAU" #Calculate P_f(E) with logistic function, with no anti-updating
+      PFE = (1-PIE)/(1+exp(game.multiplier*(d-1/2)))+PIE
+    elseif game.func == "exponential" #Calculate P_f(E) with exponential function, with anti-updating
+      PFE = exp(-game.multiplier*d)
+    elseif game.func == "exponentialNAU" #Calculate P_f(E) with exponential function, with no anti-updating
+      PFE = exp(-game.multiplier*d+log(1-PIE))+PIE
+    else
+      error("No such function") #Return error if func isn't defined
+    end
+
+    player.belief = player.belief*(PIEH*PFE/PIE + (1-PIEH)*(1-PFE)/(1-PIE)) #New belief is the result of Jeffrey conditionalizing, with P_f(E) calculated as above
+
+  end
+end
+
+@everywhere function Round(game) #Function that plays a round of the model
+  for x in game.players #For each player: perform steps (a) and (b)
+    y = []
+    for z in x.friends #(a) first determine which neighbors will perform the informative action,
+      if game.players[z].belief > .5
+        y = vcat(y,z)
+      end
+    end
+    x.goodfriends = shuffle(y) #Randomize the order of players in the "goodfriends" vector, which gives the order in which each player will update on their neighbors
+    if x.belief > .5 #then, (b) if belief > .5, produce a result by drawing from a binamial distribution
+      x.result = rand(Binomial(game.binom_n,.5+game.epsilon))
+    end
+  end
+  for x in game.players #Now that all draws have been made, update each player's beliefs using Update function.
+    Update(game,x)
+  end
+end
+
+@everywhere function InitializeGame(game,network,popSize,binom_n,epsilon,multiplier,func) #A function to initialize the network structure and set game attributes
+  #game must refer to an already-constructed object of type game; network is a string, w/ possible values of "cycle", "complete", "clumpy", or "wheel",
+  #popSize is the number of agents in the network, binom_n is that number of trials per player per round; epsilon is P_B-.5; multiplier is the parameter m; func is the
+  #name of the update function for P_f(E). (See function Update above for options.)
+  game.binom_n = binom_n #Store values from function as game attributes
+  game.epsilon = epsilon
+  game.multiplier = multiplier
+  game.players = Array{Player}(popSize)
+  game.func = func
+
+  #Generate networks.  Note that all networks are reflexive as agents update on their own results, and network structure is stored by recording each player's neighbors.
+
+  if network == "cycle" #Generate cycle network.
+    game.players[1] = Player(rand(),0,[1,2,popSize],[])
+    game.players[popSize] = Player(rand(),0,[popSize-1,popSize, 1],[])
+
+    for i = 2:(popSize-1)
+      game.players[i] = Player(rand(),0,[i-1,i, i+1],[])
+    end
+  elseif network == "complete" #Generate complete network.
+    for i = 1:popSize
+      x = []
+      for j = 1:popSize
+        x = vcat(x,j)
+      end
+      game.players[i] = Player(rand(),0,x,[])
+    end
+  elseif network == "clumpy" #Generate "clumpy" network (two complete networks of equal size [or, for odd popSize, floor(n/2) and ciel(n/2)] with a single link connecting them)
+    x = []
+    for j = 1:floor(Int64,popSize/2)
+      x = vcat(x,j)
+    end
+    for i = 1:floor(Int64,popSize/2)
+      game.players[i] = Player(rand(),0,x,[])
+    end
+    x = []
+    for j = floor(Int64,popSize/2)+1:popSize
+      x = vcat(x,j)
+    end
+    for i = floor(Int64,popSize/2)+1:popSize
+      game.players[i] = Player(rand(),0,x,[])
+    end
+    game.players[1].friends = vcat(game.players[1].friends,popSize)
+    game.players[popSize].friends = vcat(game.players[popSize].friends,1)
+  elseif network == "wheel" #Generate wheel network
+    center = popSize
+    popSize = popSize-1
+    for i = 1:popSize
+      game.players[i] = Player(rand(),0,[(i+popSize-2)%popSize+1,i,i%popSize+1,center],[])
+    end
+
+    x = unique(1:center)
+    game.players[center] = Player(rand(),0,x)
+  else
+    error("no such network type") #Return error if undefined option is used.
+  end
+end
+
+@everywhere function reInitializeGame(game) #Reinitializes game after each run of the simulation; network structure and game attributes remain the same
+  for x in game.players #randomize each player's belief
+    x.belief = rand()
+  end
+end
+
+@everywhere function play(game) #A function to execute one run of the simulation, for parameters set in game
+  reInitializeGame(game) #First reinitialize the game (i.e., randomize beliefs)
+
+  roundCounter = 0 #A parameter to count rounds to convergence
+  convergenceCheck = 0 #A flag for convergence
+
+  while convergenceCheck == 0 #Until beliefs converge, continuing doing rounds (i.e., execute Round())
+    #First check for convergence: everyone is at belief > .99; everyone is at belief < .5; or, for some functions, stable polarization has emerged
+    y=[]
+    for x in game.players y=vcat(y, x.belief) end #Create a vector of beliefs
+    if minimum(y) >= .99 #All players have belief >=.99, return outcome "true" -- true consensus
+      convergenceCheck = 1
+      return [roundCounter "true" 0] #Return the # of rounds, the outcome, and 0 [a placeholder]
+    elseif maximum(y) <= .5 #All players have belief <=.5, return outcome "false" -- false consensus
+      convergenceCheck = 1
+      return [roundCounter "false" 0] #Return the # of rounds, the outcome, and 0 [a placeholder]
+    elseif (game.func == "antiUpdate" || game.func == "logistic" || game.func == "exponential") && all(i->(i<=.01 || i>= .99), y) #For anti-update functions: if all players are either >=.99 or below <.01 return outcome "polarized"
+      convergenceCheck = 1
+      return [roundCounter "polarized" count(i->i>=.99,y)/length(game.players)] #Return the # of rounds, the outcome, and fraction of players with true belief
+    elseif game.func == "noAntiUpdate"  && !isempty(filter(i->i>=.99,y)) && all(i->((i<=.5 && min(game.multiplier*abs(minimum(filter(i->i>=.99,y))-i),1)==1) || i>= .99), y) #For noAntiUpdate: if all players are either >=.99 or else have belief <=.5 and with minimum distance s.t. they no longer listen to those performing the informative action, return outcome "polarized"
+      convergenceCheck = 1
+      return [roundCounter "polarized" count(i->i>=.99,y)/length(game.players)] #Return the # of rounds, the outcome, and fraction of players with true belief
+    end
+
+    Round(game) #Perform the next round of the game
+    roundCounter +=1 #Increase counter
+    if roundCounter >= 100000 #Check for pathological outcome and break if necessary
+      convergenceCheck = 1
+      return [roundCounter "pathology" count(i->i>=.99,y)/length(game.players)]
+    end
+  end
+end
+
+@everywhere function DoIt(popSize, networkType, epsilon, binom_n, multiplier,func, runs) #Main function to run the simulation runs times, in parallel
+  #popSize is the network size; networkType is the network configuration (a string -- see InitializeGame() for options); epsilon is P_B-.5;
+  #binom_n is the number of trials per round per player; multiplier is the parameter m in the update function; func is the update function (a string -- see Update() for details);
+  #and runs is the number of times to run the simulation.
+
+  game = Game() #Create a game with the default constructor
+
+  InitializeGame(game,networkType,popSize,binom_n,epsilon,multiplier,func) #initialize the game with the designated parameters
+  results=[] #Create a vector to record the outcome of each run
+  polarizedCounter =[] #Create a vector to record the fraction of players with true belief in each polarized outcome
+  convTime=[] #Create a vector to record convergence time
+
+  proc = Array{Any}(length(procs()),1) #Produce an array to store workers
+
+  for x = 1:ceil(runs/length(procs())) #Perform the simulation at least runs times, in parallel on all workers.  (Actual number of runs will be a multiple of the number of workers.)
+    for i = 1:length(procs()) #Run the simulation on each active process and store it in the vector of workers
+      proc[i] = @spawn play(game)
+    end
+
+    for i = 1:length(procs()) #Fetch the results from each worker and store them in the vectors created above
+      results = vcat(results,fetch(proc[i])[2]) #add the outcome of the simulation to vector results
+      polarizedCounter = vcat(polarizedCounter,fetch(proc[i])[3]) #Add the fraction of true beliefs in polarized runs to the polarizedCounter vector
+      if fetch(proc[i])[2] == "true"
+        convTime = vcat(convTime,fetch(proc[i])[1]) #add the convergence time to the convTime vector (only if the outcome was "true", since we are interested in whether Jeffrey conditionalization slows convergence to true outcomes on average)
+      end
+    end
+  end
+
+  polarizedCounter = filter(i->i!=0,polarizedCounter) #Remove 0s from polarizedCounter, as these corresponded to placeholders for outcomes where polarization did not occur and we want to average over only polarized outcomes
+
+  #Return a line for the CSV file: parameters for the run, followed by: number of true outcomes, number of false outcomes, number of polarized outcomes, average number of true beliefs in polarized outcomes, standard deviation of true beliefs in polarized outcomes, and average time to convergence for true consensus outcomes
+  [popSize epsilon binom_n multiplier count(i->i=="true",results) count(i->i=="false",results) count(i->i=="polarized",results) mean(polarizedCounter) std(polarizedCounter) mean(convTime)]
+
+end
+
+#Below are some sample loops doing parameter sweeps for various functions and writing them to CSV files.
+
+for func in ["logistic"]
+  for popSize in [6,10,20]
+    results = Array(Any,(0,10))
+    for binom_n in [1,5,10,20,50,100]
+      for epsilon in [.05,.1,.2]
+        for multiplier in [5,7.5,10,12.5,15,17.5,20]
+          results = vcat(results,DoIt(popSize,"complete",epsilon,binom_n,multiplier,func,1000))
+        end
+      end
+    end
+    writecsv("results $func popSize$popSize stable beliefs.csv",results)
+  end
+end
+
+for func in ["exponential"]
+  for popSize in [6,10,20]
+    results = Array(Any,(0,10))
+    for binom_n in [1,5,10,20,50,100]
+      for epsilon in [.05,.1,.2]
+        for multiplier in [1,2,3,4,5,6,7]
+          results = vcat(results,DoIt(popSize,"complete",epsilon,binom_n,multiplier,func,1000))
+        end
+      end
+    end
+    writecsv("results $func popSize$popSize stable beliefs.csv",results)
+  end
+end
+
+for func in ["noAntiUpdate","antiUpdate"]
+  for popSize in [10]
+    results = Array(Any,(0,10))
+    for binom_n in [1,5,10,20,50,100]
+      for epsilon in [.05,.1,.2]
+        for multiplier in [1, 1.1, 1.25, 1.5, 1.75, 2, 2.25, 2.5, 2.75, 3]
+          results = vcat(results,DoIt(popSize,"complete",epsilon,binom_n,multiplier,func,1000))
+        end
+      end
+    end
+    writecsv("results $func popSize$popSize stable beliefs (shuffle)).csv",results)
+  end
+end
