@@ -1,3 +1,0 @@
-# Polarization
-# Polarization
-# Polarization
